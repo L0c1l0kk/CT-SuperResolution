@@ -5,14 +5,18 @@ import SimpleITK as sitk
 import trimesh, vtk, os, tqdm
 import pyvista as pv
 import nibabel as nib
-from scipy.ndimage import gaussian_filter
 from skimage import measure
+from pathlib import Path
 
 from totalsegmentator.python_api import totalsegmentator
 from totalsegmentator.nifti_ext_header import load_multilabel_nifti
+from totalsegmentator.map_to_binary import class_map, class_map_5_parts, map_taskid_to_partname_ct
+import totalsegmentator.nnunet as ts_nnunet
 
 from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray
 from surface_distance import metrics as surface_metrics
+import tempfile
+
 
 from config import HFValid, pred_path
 
@@ -165,6 +169,45 @@ def calculate_metrics(
     }
     return {"assd_mm": float(assd), "hd95_mm": float(hd95), "surface_dice": surface_dice}
 
+
+TARGETS = ["femur_left", "femur_right"]   # extend for other bones
+
+_total_inv = {n: i for i, n in class_map["total"].items()}        # name -> global label
+_where = {n: (part, idx) for part, cmap in class_map_5_parts.items()
+          for idx, n in cmap.items()}                              # name -> (part, channel)
+_tid_of_part = {v: k for k, v in map_taskid_to_partname_ct.items()}
+
+
+def run_total_with_probs(nifti_path, out_prefix, device, targets, probs_dir):
+    """Standard full `total` run; saves probabilities only for sub-models containing `targets`."""
+    wanted = {}   # task id -> [(name, channel)]
+    for t in targets:
+        part, ch = _where[t]
+        wanted.setdefault(_tid_of_part[part], []).append((t, ch))
+
+    orig = ts_nnunet.nnUNetv2_predict
+
+    def patched(dir_in, dir_out, task_id, *args, save_probabilities_path=None, **kwargs):
+        path = Path(probs_dir) / f"probs_{task_id}.npz" if task_id in wanted else None
+        return orig(dir_in, dir_out, task_id, *args, save_probabilities_path=path, **kwargs)
+
+    ts_nnunet.nnUNetv2_predict = patched
+    try:
+        totalsegmentator(input=nifti_path, output=out_prefix, ml=True,
+                         device=device, quiet=True)               # no roi_subset, no save_probabilities
+    finally:
+        ts_nnunet.nnUNetv2_predict = orig                         # always restore
+
+    out = {}
+    for tid, items in wanted.items():
+        f = Path(probs_dir) / f"probs_{tid}.npz"
+        P = np.load(f)["probabilities"]
+        for name, ch in items:
+            out[name] = P[ch]
+        f.unlink()
+        f.with_suffix(".pkl").unlink(missing_ok=True)
+    return out
+
 def ts_predict(subject_ids:list[int] | str, device:str="gpu", output_dir:str=pred_path):
     
     
@@ -196,27 +239,16 @@ def ts_predict(subject_ids:list[int] | str, device:str="gpu", output_dir:str=pre
         nifti_path=os.path.join(subject_dir, f"{subject}.nii.gz")
         sitk.WriteImage(image, nifti_path)
         
-        totalsegmentator(
-            input=nifti_path,
-            output=output_subject_dir+"/ml_segmentation",
-            ml=True,
-            device=device,
-            quiet=True,
-            save_probabilities=output_subject_dir+"/probs.npz"
-        )
-        femur_left=76
-        femur_right=77
-        _,label_map=load_multilabel_nifti(os.path.join(output_subject_dir, "ml_segmentation.nii"))
-        segmentation=sitk.ReadImage(os.path.join(output_subject_dir, "ml_segmentation.nii"))
-        seg_array=sitk.GetArrayFromImage(segmentation)
-        femur_left_mask = seg_array == femur_left
-        femur_right_mask = seg_array == femur_right
-        probabilities=np.load(os.path.join(output_subject_dir, "probs.npz"))["probabilities"]
-        os.remove(os.path.join(output_subject_dir, "probs.npz"))
-        femur_left_probs=probabilities[femur_left]
-        femur_right_probs=probabilities[femur_right]
+        probs = run_total_with_probs(nifti_path, output_subject_dir + "/ml_segmentation",
+                                    device, TARGETS, output_subject_dir)
+        segmentation = sitk.ReadImage(os.path.join(output_subject_dir, "ml_segmentation.nii"))
+        seg_array = sitk.GetArrayFromImage(segmentation)
+
+        femur_left_mask  = seg_array == _total_inv["femur_left"]
+        femur_right_mask = seg_array == _total_inv["femur_right"]
+        femur_left_probs, femur_right_probs = probs["femur_left"], probs["femur_right"]
         
-        anything_else=~np.isin(seg_array, [femur_left, femur_right])
+        anything_else=~np.isin(seg_array, [0, _total_inv["femur_left"], _total_inv["femur_right"]])
         
         if(anything_else.any()):
             warnings.warn(f"Other labels are present for {subject}.")
