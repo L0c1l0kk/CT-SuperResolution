@@ -1,0 +1,275 @@
+import warnings
+
+import numpy as np
+import SimpleITK as sitk
+import trimesh, vtk, os, tqdm
+import pyvista as pv
+import nibabel as nib
+from scipy.ndimage import gaussian_filter
+from skimage import measure
+
+from totalsegmentator.python_api import totalsegmentator
+from totalsegmentator.nifti_ext_header import load_multilabel_nifti
+
+from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray
+from surface_distance import metrics as surface_metrics
+
+from config import HFValid, pred_path
+
+def stl_to_ct_mask(stl_path, ct_path=None, ct_image=None, output_path=None):
+    
+    if ct_image is None and ct_path is None:
+        raise ValueError("Either ct_path or ct_image must be provided.")
+    
+    mesh=trimesh.load_mesh(stl_path, file_type='stl')
+    if mesh.is_empty:
+        raise ValueError(f"Mesh is empty: {stl_path}")
+    
+    if not mesh.is_watertight:
+        raise ValueError(
+            "The STL mesh is not watertight. "
+        )
+    
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    
+    if ct_image is None:
+        ct_image=sitk.ReadImage(ct_path)
+    
+    size=np.asarray(ct_image.GetSize())
+    spacing=np.asarray(ct_image.GetSpacing())
+    origin=np.asarray(ct_image.GetOrigin())
+    direction=np.asarray(ct_image.GetDirection()).reshape(3, 3)
+    
+    #conversion matrix and index coordinates
+    physical_to_index_matrix = np.linalg.inv(direction) @ np.diag(1 / spacing)
+    
+    index_vertices = (vertices - origin) @ physical_to_index_matrix.T
+    
+    if(index_vertices.min() < 0 or index_vertices.max() >= size).any():
+        warnings.warn(
+            "Some vertices are outside the CT image bounds. "
+            "The resulting mask may be incomplete."
+        )
+    
+    #vtk points and faces
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetNumberOfPoints(len(index_vertices))
+    vtk_points.SetData(numpy_to_vtk(index_vertices, deep=True))
+    
+    n_faces=len(mesh.faces)
+    offsets=np.arange(0, n_faces * 3+1, 3, dtype=np.int64)
+    connectivity=np.asarray(mesh.faces, dtype=np.int64).flatten()
+    
+    vtk_faces=vtk.vtkCellArray()
+    vtk_faces.SetData(
+        numpy_to_vtkIdTypeArray(offsets, deep=True),
+        numpy_to_vtkIdTypeArray(connectivity, deep=True)
+    )
+    vtk_mesh=vtk.vtkPolyData()
+    vtk_mesh.SetPoints(vtk_points)
+    vtk_mesh.SetPolys(vtk_faces)
+    
+    # Create a unit-spaced grid in index coordinates.
+    reference = vtk.vtkImageData()
+    reference.SetDimensions(*[int(v) for v in size])
+    reference.SetOrigin(0, 0, 0)
+    reference.SetSpacing(1, 1, 1)
+    reference.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+    
+    vtk_to_numpy(
+        reference.GetPointData().GetScalars()
+    ).fill(1)
+    
+    poly_to_stencil = vtk.vtkPolyDataToImageStencil()
+    poly_to_stencil.SetInputData(vtk_mesh)
+    poly_to_stencil.SetOutputOrigin(0, 0, 0)
+    poly_to_stencil.SetOutputSpacing(1, 1, 1)
+    poly_to_stencil.SetOutputWholeExtent(reference.GetExtent())
+    poly_to_stencil.Update()
+    
+    stencil = vtk.vtkImageStencil()
+    stencil.SetInputData(reference)
+    stencil.SetStencilConnection(
+        poly_to_stencil.GetOutputPort()
+    )
+    stencil.ReverseStencilOff()
+    stencil.SetBackgroundValue(0)
+    stencil.Update()
+    
+    result = vtk_to_numpy(
+        stencil.GetOutput().GetPointData().GetScalars()
+    ).reshape(size[2], size[1], size[0])
+
+    return result.astype(bool)
+
+
+def image_to_mesh(img: sitk.Image, level=0.5):
+    """Marching cubes on a SimpleITK image -> trimesh in physical (LPS, mm) coordinates."""
+    vol = sitk.GetArrayFromImage(img).astype(np.float32)   # (z, y, x)
+    pad_value = vol.min() if level == 0 else 0.0           # SDF: pad with "outside" (most negative or positive depends on your sign convention, see note)
+    vol = np.pad(vol, 1, constant_values=pad_value)
+    verts_zyx, faces, _, _ = measure.marching_cubes(vol, level=level)
+    idx_xyz = verts_zyx[:, ::-1] - 1.0                     # undo padding, reorder to (x, y, z)
+
+    spacing = np.array(img.GetSpacing())
+    origin = np.array(img.GetOrigin())
+    D = np.array(img.GetDirection()).reshape(3, 3)
+    verts_mm = origin + (idx_xyz * spacing) @ D.T
+    return trimesh.Trimesh(verts_mm, faces, process=False)
+
+
+def _closest_distances(mesh_pv: pv.PolyData, pts: np.ndarray) -> np.ndarray:
+    # exact point-to-triangle distances
+    _, closest = mesh_pv.find_closest_cell(pts, return_closest_point=True)
+    return np.linalg.norm(pts - closest, axis=1)
+
+
+def calculate_metrics(
+    pred: sitk.Image,          # binary mask, probability map, or signed distance
+    gt_stl_path,
+    stl_is_ras=False,          # True if the STL is in RAS (3D Slicer export)
+    level=0.5,
+    n_points=100_000,
+    tolerances_mm=(0.5, 1.0),
+    seed=0,
+):
+    if not (sitk.GetArrayViewFromImage(pred) > level).any():
+        raise ValueError("Prediction has no foreground.")
+
+    gt_mesh = trimesh.load_mesh(gt_stl_path, force="mesh")
+    if stl_is_ras:
+        gt_mesh.vertices[:, :2] *= -1                      # RAS -> LPS
+
+    pred_mesh = image_to_mesh(pred, level=level)
+
+    offset = np.linalg.norm(gt_mesh.bounds.mean(axis=0) - pred_mesh.bounds.mean(axis=0))
+    if offset > 30:
+        warnings.warn(f"GT and prediction are {offset:.0f} mm apart; check RAS/LPS and origin.")
+
+    pts_gt, _ = trimesh.sample.sample_surface(gt_mesh, n_points, seed=seed)
+    pts_pred, _ = trimesh.sample.sample_surface(pred_mesh, n_points, seed=seed)
+
+    gt_pv = pv.wrap(gt_mesh)       # trimesh -> pyvista
+    pred_pv = pv.wrap(pred_mesh)
+    d_gt_to_pred = _closest_distances(pred_pv, pts_gt)
+    d_pred_to_gt = _closest_distances(gt_pv, pts_pred)
+
+    assd = 0.5 * (d_gt_to_pred.mean() + d_pred_to_gt.mean())
+    hd95 = max(np.percentile(d_gt_to_pred, 95), np.percentile(d_pred_to_gt, 95))
+
+    a_gt, a_pred = gt_mesh.area, pred_mesh.area
+    surface_dice = {
+        tau: float((a_gt * np.mean(d_gt_to_pred <= tau) + a_pred * np.mean(d_pred_to_gt <= tau))
+                   / (a_gt + a_pred))
+        for tau in tolerances_mm
+    }
+    return {"assd_mm": float(assd), "hd95_mm": float(hd95), "surface_dice": surface_dice}
+
+def ts_predict(subject_ids:list[int] | str, device:str="gpu", output_dir:str=pred_path):
+    
+    
+    if isinstance(subject_ids, str):
+        if subject_ids.lower() == "all":
+            available_subjects = os.listdir(HFValid+"/Subjects")
+            if(len(available_subjects) != 101):
+                raise ValueError(f"Missing patients. Check the data.")
+        else:
+            raise ValueError(f"Invalid subject_ids string: {subject_ids}. Use 'all' or a list of integers.")
+    else:
+        subjects=set([f"Pat{str(i).zfill(3)}" for i in subject_ids])
+        available_subjects=subjects.intersection(set(os.listdir(HFValid+"/Subjects")))
+        if len(available_subjects)!=len(subjects):
+            if len(available_subjects)==0:
+                raise ValueError(f"No patients found in {HFValid}/Subjects. Check the path.")
+            missing_patients=subjects.difference(available_subjects)
+            raise ValueError(f"Missing patients: {missing_patients}")
+    
+    
+    
+    for subject in tqdm.tqdm(available_subjects, desc="TotalSegmentator predictions"):
+        subject_dir=os.path.join(HFValid, "Subjects", subject)
+        output_subject_dir=os.path.join(output_dir, subject)
+        os.makedirs(output_subject_dir, exist_ok=True)
+        
+        # Convert NRRD to NIfTI
+        image=sitk.ReadImage(os.path.join(subject_dir, f"{subject}.nrrd"))
+        nifti_path=os.path.join(subject_dir, f"{subject}.nii.gz")
+        sitk.WriteImage(image, nifti_path)
+        
+        totalsegmentator(
+            input=nifti_path,
+            output=output_subject_dir+"/ml_segmentation",
+            ml=True,
+            device=device,
+            quiet=True,
+            save_probabilities=output_subject_dir+"/probs.npz"
+        )
+        femur_left=76
+        femur_right=77
+        _,label_map=load_multilabel_nifti(os.path.join(output_subject_dir, "ml_segmentation.nii"))
+        segmentation=sitk.ReadImage(os.path.join(output_subject_dir, "ml_segmentation.nii"))
+        seg_array=sitk.GetArrayFromImage(segmentation)
+        femur_left_mask = seg_array == femur_left
+        femur_right_mask = seg_array == femur_right
+        probabilities=np.load(os.path.join(output_subject_dir, "probs.npz"))["probabilities"]
+        os.remove(os.path.join(output_subject_dir, "probs.npz"))
+        femur_left_probs=probabilities[femur_left]
+        femur_right_probs=probabilities[femur_right]
+        
+        anything_else=~np.isin(seg_array, [femur_left, femur_right])
+        
+        if(anything_else.any()):
+            warnings.warn(f"Other labels are present for {subject}.")
+        
+        if(femur_left_mask.any() and femur_right_mask.any()):
+            warnings.warn(f"Both femur left and right masks are present for {subject}. Check the segmentation.")
+            femur_left=sitk.GetImageFromArray(femur_left_mask.astype(np.uint8))
+            femur_left.CopyInformation(segmentation)
+            femur_right=sitk.GetImageFromArray(femur_right_mask.astype(np.uint8))
+            femur_right.CopyInformation(segmentation)
+            sitk.WriteImage(femur_left, os.path.join(output_subject_dir, "femur_left.nii"))
+            sitk.WriteImage(femur_right, os.path.join(output_subject_dir, "femur_right.nii"))
+            np.save(os.path.join(output_subject_dir, "femur_left_probs.npy"), femur_left_probs)
+            np.save(os.path.join(output_subject_dir, "femur_right_probs.npy"), femur_right_probs)
+            
+        elif(femur_left_mask.any() or femur_right_mask.any()):
+            mask=femur_left_mask if femur_left_mask.any() else femur_right_mask
+            probs=femur_left_probs if femur_left_mask.any() else femur_right_probs
+            seg=sitk.GetImageFromArray(mask.astype(np.uint8))
+            seg.CopyInformation(segmentation)
+            sitk.WriteImage(seg, os.path.join(output_subject_dir, "segmentation.nii"))
+            np.save(os.path.join(output_subject_dir, "probs.npy"), probs)
+
+
+def vertex_lattice_check(stl_path, nrrd_path, stl_is_ras=False, eps=0.03):
+    img = sitk.ReadImage(nrrd_path)
+    v = np.asarray(trimesh.load_mesh(stl_path).vertices, dtype=float).copy()
+    if stl_is_ras:
+        v[:, :2] *= -1  # RAS -> LPS
+
+    spacing = np.array(img.GetSpacing())
+    origin = np.array(img.GetOrigin())
+    D = np.array(img.GetDirection()).reshape(3, 3)
+
+    # physical -> continuous index (x, y, z); integer index = voxel centre
+    idx = ((v - origin) @ D) / spacing
+
+    # sanity: are the vertices inside the volume at all?
+    size = np.array(img.GetSize())
+    inside = np.all((idx > -0.5) & (idx < size - 0.5), axis=1).mean()
+
+    frac = idx % 1.0
+    on_centre = (frac < eps) | (frac > 1 - eps)   # fractional part ~ 0
+    on_mid = np.abs(frac - 0.5) < eps             # fractional part ~ 0.5
+    on_lattice = on_centre | on_mid
+
+    all3 = on_lattice.all(axis=1).mean()
+    one_mid = ((on_mid.sum(axis=1) == 1) & (on_centre.sum(axis=1) == 2)).mean()
+    chance = (4 * eps) ** 3                       # expected if fractional parts were uniform
+
+    print(f"vertices inside volume:                {inside:.3f}")
+    print(f"all 3 axes on {{0, 0.5}} lattice:         {all3:.3f}  (chance ~ {chance:.4f})")
+    print(f"exactly one axis at 0.5, two at 0:     {one_mid:.3f}")
+    for ax, name in enumerate("xyz"):
+        h, _ = np.histogram(frac[:, ax], bins=10, range=(0, 1))
+        print(f"axis {name} fractional-part histogram:", (h / h.sum()).round(3)) 
