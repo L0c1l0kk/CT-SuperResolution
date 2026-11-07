@@ -151,36 +151,55 @@ def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_ma
         ts_path = os.path.join(ts_pred_path, subject)
         if not os.path.exists(ts_path):
             raise ValueError(f"TotalSegmentator predictions not found for {subject} in {ts_pred_path}. Run TotalSegmentator first.")
-        if "segmentation.nii" not in os.listdir(ts_path):
-            if all(element in os.listdir(ts_path) for element in ["left_femur.nii","right_femur.nii"]):
-                warnings.warn(f"TotalSegmentator predicted both femurs for {subject}, skipping subject.")
-                continue
-            else:
-                raise ValueError(f"segmentation.nii not found for {subject} in {ts_path}.")
-        ts_mask_image=sitk.ReadImage(os.path.join(ts_path, "segmentation.nii"))
-        ts_spacing = np.array([1.5, 1.5, 1.5])  # TotalSegmentator spacing
+        
+        targets=["femur_left,femur_right"]
+        target=""
+        if all(element in os.listdir(ts_path) for element in [target+".nii" for target in targets]):
+            warnings.warn(f"TotalSegmentator predicted both femurs for {subject}, skipping subject.")
+            continue
+        elif not any(element in os.listdir(ts_path) for element in ["femur_left.nii","femur_right.nii",]):
+            raise ValueError(f"segmentation.nii not found for {subject} in {ts_path}.")
+        else:
+            if "femur_left.nii" in os.listdir(ts_path):
+                target=targets[0]
+            elif "femur_right.nii" in os.listdir(ts_path):
+                target=targets[1]
+        ts_spacing = np.array([1.5, 1.5, 1.5])  # TotalSegmentator spacing        
+        
+        try:
+            ts_low_res_image=sitk.ReadImage(os.path.join(ts_path, "image_1p5mm.nii.gz"))
+            ts_full_res_mask_image=sitk.ReadImage(os.path.join(ts_path, target+".nii"))
+            ts_low_res_mask_image=sitk.ReadImage(os.path.join(ts_path,target+"_mask_1p5mm.nii.gz"))
+            ts_prob_map=np.load(os.path.join(ts_path,target+"_prob_1p5mm.nii.gz"))
+            
+        except Exception as e:
+            raise ValueError(f"Error reading TotalSegmentator predictions for {subject} in {ts_path}: {e}")
+        
+
+        subject_id=int(subject[3:])
+
+        #TotalSegmentator metrics
+        ts_metrics = calculate_metrics(ts_full_res_mask_image, stl_path)
+        ts_metrics["baseline"] = "TotalSegmentator"
+        ts_metrics["subject_id"] = subject_id
 
         # Oracle baseline
         _, oracle_mask_image = oracle(ct_image, stl_path, ts_spacing)
         oracle_metrics = calculate_metrics(oracle_mask_image, stl_path)
         oracle_metrics["baseline"] = "oracle"
-        oracle_metrics["subject_id"] = int(subject[3:]) 
+        oracle_metrics["subject_id"] = subject_id
         
         # Trilinear interpolation baseline
-        trilinear_mask = trilinear_interpolation(ts_mask_image, ct_image.GetSpacing(), threshold=threshold)
+        trilinear_mask = trilinear_interpolation(ts_low_res_mask_image, ct_image.GetSpacing(), threshold=threshold)
         trilinear_metrics = calculate_metrics(trilinear_mask, stl_path)
         trilinear_metrics["baseline"] = "trilinear_interpolation"
-        trilinear_metrics["subject_id"] = int(subject[3:])
+        trilinear_metrics["subject_id"] = subject_id
         
         # Probability mask interpolation baseline
-        prob_map_path = os.path.join(ts_path, "probs.npy")
-        if not os.path.exists(prob_map_path):
-            raise ValueError(f"Probability map not found for {subject} in {ts_path}.")
-        prob_map = np.load(prob_map_path)
-        prob_mask = probability_mask_interpolation(ct_image, prob_map, ts_spacing, threshold=threshold)
+        prob_mask = probability_mask_interpolation(ts_low_res_image, ts_prob_map, ts_spacing, threshold=threshold)
         prob_metrics = calculate_metrics(prob_mask, stl_path)
         prob_metrics["baseline"] = "probability_mask_interpolation"
-        prob_metrics["subject_id"] = int(subject[3:])
+        prob_metrics["subject_id"] = subject_id
 
         results[subject] = {
             "oracle": oracle_metrics,

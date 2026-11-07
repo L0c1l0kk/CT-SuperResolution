@@ -9,13 +9,12 @@ from skimage import measure
 from pathlib import Path
 
 from totalsegmentator.python_api import totalsegmentator
-from totalsegmentator.nifti_ext_header import load_multilabel_nifti
+from totalsegmentator.alignment import undo_canonical
 from totalsegmentator.map_to_binary import class_map, class_map_5_parts, map_taskid_to_partname_ct
 import totalsegmentator.nnunet as ts_nnunet
 
 from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray
 from surface_distance import metrics as surface_metrics
-import tempfile
 
 
 from config import HFValid, pred_path
@@ -174,103 +173,158 @@ TARGETS = ["femur_left", "femur_right"]   # extend for other bones
 
 _total_inv = {n: i for i, n in class_map["total"].items()}        # name -> global label
 _where = {n: (part, idx) for part, cmap in class_map_5_parts.items()
-          for idx, n in cmap.items()}                              # name -> (part, channel)
+          for idx, n in cmap.items()}                              # name -> (sub-model, channel)
 _tid_of_part = {v: k for k, v in map_taskid_to_partname_ct.items()}
 
 
-def run_total_with_probs(nifti_path, out_prefix, device, targets, probs_dir):
-    """Standard full `total` run; saves probabilities only for sub-models containing `targets`."""
+def _to_original_orientation(data, affine, img_orig):
+    """Wrap `data` (TotalSegmentator's canonical orientation) as NIfTI and undo the reorientation."""
+    return undo_canonical(nib.Nifti1Image(data, affine), img_orig)
+
+
+def run_total_with_probs(nifti_path, out_prefix, device, targets, work_dir):
+    """Standard full `total` run (1.5 mm model, no roi_subset) that also captures its 1.5 mm data.
+
+    Two internals of `totalsegmentator.nnunet` are hooked for the duration of the call:
+      * nnUNetv2_predict: probabilities are saved only for the sub-model(s) containing `targets`
+        (with a single path every sub-model would overwrite the previous one's file).
+      * change_spacing:   captures the CT as resampled to 1.5 mm and the merged 1.5 mm label map
+                          just before TotalSegmentator upsamples it to the original grid.
+
+    The full-resolution segmentation is written to `out_prefix` as usual.
+
+    Returns {"image": nib image, "labels": nib image, "probs": {target: nib image}}, all on the
+    1.5 mm grid, in the orientation of the input, each carrying its own affine.
+    `work_dir` only holds temporary probability files, which are removed again.
+    """
+    work_dir = Path(work_dir)
     wanted = {}   # task id -> [(name, channel)]
     for t in targets:
         part, ch = _where[t]
         wanted.setdefault(_tid_of_part[part], []).append((t, ch))
+    prob_files = {tid: work_dir / f"probs_{tid}.npz" for tid in wanted}
 
-    orig = ts_nnunet.nnUNetv2_predict
+    captured = {}
+    orig_predict, orig_resample = ts_nnunet.nnUNetv2_predict, ts_nnunet.change_spacing
 
-    def patched(dir_in, dir_out, task_id, *args, save_probabilities_path=None, **kwargs):
-        path = Path(probs_dir) / f"probs_{task_id}.npz" if task_id in wanted else None
-        return orig(dir_in, dir_out, task_id, *args, save_probabilities_path=path, **kwargs)
+    def predict_hook(dir_in, dir_out, task_id, *args, save_probabilities_path=None, **kwargs):
+        return orig_predict(dir_in, dir_out, task_id, *args,
+                            save_probabilities_path=prob_files.get(task_id), **kwargs)
 
-    ts_nnunet.nnUNetv2_predict = patched
+    def resample_hook(img_in, new_spacing=1.25, target_shape=None, *args, **kwargs):
+        result = orig_resample(img_in, new_spacing, target_shape, *args, **kwargs)
+        if target_shape is None:                 # forward call: CT -> 1.5 mm
+            captured.setdefault("image", result)
+        else:                                    # back call: merged 1.5 mm labels -> original grid
+            # copy the data now; img_in may be backed by a temp file that TotalSegmentator deletes
+            captured["labels"] = np.asarray(img_in.get_fdata()).astype(np.uint8)
+        return result
+
+    ts_nnunet.nnUNetv2_predict, ts_nnunet.change_spacing = predict_hook, resample_hook
     try:
-        totalsegmentator(input=nifti_path, output=out_prefix, ml=True,
-                         device=device, quiet=True)               # no roi_subset, no save_probabilities
+        totalsegmentator(input=nifti_path, output=out_prefix, ml=True, device=device, quiet=True)
     finally:
-        ts_nnunet.nnUNetv2_predict = orig                         # always restore
+        ts_nnunet.nnUNetv2_predict, ts_nnunet.change_spacing = orig_predict, orig_resample
 
-    out = {}
+    if "image" not in captured or "labels" not in captured:
+        raise RuntimeError("Could not capture TotalSegmentator's 1.5 mm data; the hooks target "
+                           "`totalsegmentator.nnunet.change_spacing`, check the installed version.")
+
+    img_orig = nib.load(nifti_path)
+    image, labels_xyz = captured["image"], captured["labels"]
+    if labels_xyz.shape != image.shape:
+        raise ValueError(f"Label map {labels_xyz.shape} does not match 1.5 mm image {image.shape}.")
+
+    result = {
+        "image": undo_canonical(image, img_orig),
+        "labels": _to_original_orientation(labels_xyz, image.affine, img_orig),
+        "probs": {},
+    }
     for tid, items in wanted.items():
-        f = Path(probs_dir) / f"probs_{tid}.npz"
-        P = np.load(f)["probabilities"]
-        for name, ch in items:
-            out[name] = P[ch]
-        f.unlink()
-        f.with_suffix(".pkl").unlink(missing_ok=True)
-    return out
+        try:
+            with np.load(prob_files[tid]) as npz:
+                probs = npz["probabilities"]                       # (channels, z, y, x)
+            for name, ch in items:
+                prob_xyz = np.ascontiguousarray(probs[ch].transpose(2, 1, 0), dtype=np.float32)
+                if prob_xyz.shape != image.shape:
+                    raise ValueError(f"{name}: probabilities {prob_xyz.shape} do not match "
+                                     f"1.5 mm image {image.shape}.")
+                result["probs"][name] = _to_original_orientation(prob_xyz, image.affine, img_orig)
+            del probs
+        finally:
+            prob_files[tid].unlink(missing_ok=True)
+            prob_files[tid].with_suffix(".pkl").unlink(missing_ok=True)
+    return result
 
-def ts_predict(subject_ids:list[int] | str, device:str="gpu", output_dir:str=pred_path):
-    
-    
+
+def ts_predict(subject_ids: list[int] | str, device: str = "gpu", output_dir: str = pred_path):
+    """Run TotalSegmentator (standard 1.5 mm `total` model) on HFValid subjects.
+
+    Written to <output_dir>/<subject>/:
+        ml_segmentation.nii            full-res multilabel segmentation (TotalSegmentator output)
+        image_1p5mm.nii.gz             CT as resampled for the model
+        ml_segmentation_1p5mm.nii.gz   merged 1.5 mm label map, before upsampling
+      and for each femur found:
+        <femur>.nii                    full-res binary mask
+        <femur>_mask_1p5mm.nii.gz      1.5 mm binary mask
+        <femur>_prob_1p5mm.nii.gz      1.5 mm probability map
+    All 1.5 mm files are NIfTI in the input's orientation, so SimpleITK aligns them by geometry.
+    """
+    subjects_dir = os.path.join(HFValid, "Subjects")
     if isinstance(subject_ids, str):
-        if subject_ids.lower() == "all":
-            available_subjects = os.listdir(HFValid+"/Subjects")
-            if(len(available_subjects) != 101):
-                raise ValueError(f"Missing patients. Check the data.")
-        else:
+        if subject_ids.lower() != "all":
             raise ValueError(f"Invalid subject_ids string: {subject_ids}. Use 'all' or a list of integers.")
+        available_subjects = os.listdir(subjects_dir)
+        if len(available_subjects) != 101:
+            raise ValueError("Missing patients. Check the data.")
     else:
-        subjects=set([f"Pat{str(i).zfill(3)}" for i in subject_ids])
-        available_subjects=subjects.intersection(set(os.listdir(HFValid+"/Subjects")))
-        if len(available_subjects)!=len(subjects):
-            if len(available_subjects)==0:
-                raise ValueError(f"No patients found in {HFValid}/Subjects. Check the path.")
-            missing_patients=subjects.difference(available_subjects)
-            raise ValueError(f"Missing patients: {missing_patients}")
-    
-    
-    
-    for subject in tqdm.tqdm(available_subjects, desc="TotalSegmentator predictions"):
-        subject_dir=os.path.join(HFValid, "Subjects", subject)
-        output_subject_dir=os.path.join(output_dir, subject)
-        os.makedirs(output_subject_dir, exist_ok=True)
-        
-        # Convert NRRD to NIfTI
-        image=sitk.ReadImage(os.path.join(subject_dir, f"{subject}.nrrd"))
-        nifti_path=os.path.join(subject_dir, f"{subject}.nii.gz")
-        sitk.WriteImage(image, nifti_path)
-        
-        probs = run_total_with_probs(nifti_path, output_subject_dir + "/ml_segmentation",
-                                    device, TARGETS, output_subject_dir)
-        segmentation = sitk.ReadImage(os.path.join(output_subject_dir, "ml_segmentation.nii"))
-        seg_array = sitk.GetArrayFromImage(segmentation)
+        subjects = {f"Pat{i:03d}" for i in subject_ids}
+        available_subjects = subjects & set(os.listdir(subjects_dir))
+        if not available_subjects:
+            raise ValueError(f"No patients found in {subjects_dir}. Check the path.")
+        if available_subjects != subjects:
+            raise ValueError(f"Missing patients: {subjects - available_subjects}")
 
-        femur_left_mask  = seg_array == _total_inv["femur_left"]
-        femur_right_mask = seg_array == _total_inv["femur_right"]
-        femur_left_probs, femur_right_probs = probs["femur_left"], probs["femur_right"]
-        
-        anything_else=~np.isin(seg_array, [0, _total_inv["femur_left"], _total_inv["femur_right"]])
-        
-        if(anything_else.any()):
+    femur_labels = {name: _total_inv[name] for name in TARGETS}
+
+    for subject in tqdm.tqdm(sorted(available_subjects), desc="TotalSegmentator predictions"):
+        subject_dir = os.path.join(subjects_dir, subject)
+        out_dir = os.path.join(output_dir, subject)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Convert NRRD to NIfTI
+        image = sitk.ReadImage(os.path.join(subject_dir, f"{subject}.nrrd"))
+        nifti_path = os.path.join(subject_dir, f"{subject}.nii.gz")
+        sitk.WriteImage(image, nifti_path)
+
+        lowres = run_total_with_probs(nifti_path, os.path.join(out_dir, "ml_segmentation"),
+                                      device, TARGETS, out_dir)
+        nib.save(lowres["image"], os.path.join(out_dir, "image_1p5mm.nii.gz"))
+        nib.save(lowres["labels"], os.path.join(out_dir, "ml_segmentation_1p5mm.nii.gz"))
+
+        segmentation = sitk.ReadImage(os.path.join(out_dir, "ml_segmentation.nii"))
+        seg_array = sitk.GetArrayFromImage(segmentation)
+        lowres_array = np.asanyarray(lowres["labels"].dataobj)
+
+        if (~np.isin(seg_array, [0, *femur_labels.values()])).any():
             warnings.warn(f"Other labels are present for {subject}.")
-        
-        if(femur_left_mask.any() and femur_right_mask.any()):
+
+        found = [name for name, label in femur_labels.items() if (seg_array == label).any()]
+        if not found:
+            warnings.warn(f"No femur found for {subject}.")
+        elif len(found) > 1:
             warnings.warn(f"Both femur left and right masks are present for {subject}. Check the segmentation.")
-            femur_left=sitk.GetImageFromArray(femur_left_mask.astype(np.uint8))
-            femur_left.CopyInformation(segmentation)
-            femur_right=sitk.GetImageFromArray(femur_right_mask.astype(np.uint8))
-            femur_right.CopyInformation(segmentation)
-            sitk.WriteImage(femur_left, os.path.join(output_subject_dir, "femur_left.nii"))
-            sitk.WriteImage(femur_right, os.path.join(output_subject_dir, "femur_right.nii"))
-            np.save(os.path.join(output_subject_dir, "femur_left_probs.npy"), femur_left_probs)
-            np.save(os.path.join(output_subject_dir, "femur_right_probs.npy"), femur_right_probs)
-            
-        elif(femur_left_mask.any() or femur_right_mask.any()):
-            mask=femur_left_mask if femur_left_mask.any() else femur_right_mask
-            probs=femur_left_probs if femur_left_mask.any() else femur_right_probs
-            seg=sitk.GetImageFromArray(mask.astype(np.uint8))
-            seg.CopyInformation(segmentation)
-            sitk.WriteImage(seg, os.path.join(output_subject_dir, "segmentation.nii"))
-            np.save(os.path.join(output_subject_dir, "probs.npy"), probs)
+
+        for name in found:
+            label = femur_labels[name]
+
+            mask = sitk.GetImageFromArray((seg_array == label).astype(np.uint8))
+            mask.CopyInformation(segmentation)
+            sitk.WriteImage(mask, os.path.join(out_dir, f"{name}.nii"))
+
+            lowres_mask = nib.Nifti1Image((lowres_array == label).astype(np.uint8), lowres["labels"].affine)
+            nib.save(lowres_mask, os.path.join(out_dir, f"{name}_mask_1p5mm.nii.gz"))
+            nib.save(lowres["probs"][name], os.path.join(out_dir, f"{name}_prob_1p5mm.nii.gz"))
 
 
 def vertex_lattice_check(stl_path, nrrd_path, stl_is_ras=False, eps=0.03):
