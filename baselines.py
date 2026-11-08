@@ -65,24 +65,21 @@ def trilinear_interpolation(mask_image:sitk.Image, new_spacing, threshold=0.5):
     
     return upsampled_mask
 
-def probability_mask_interpolation(image:sitk.Image, prob_map:np.ndarray, new_spacing, threshold=0.5):
+def probability_mask_interpolation(image:sitk.Image, prob_map:sitk.Image, new_spacing, threshold=0.5):
     """Upsample the probability map to the new spacing using trilinear interpolation."""
 
     new_size = _calculate_new_size(image.GetSize(), image.GetSpacing(), new_spacing)
 
-    prob_map_image = sitk.GetImageFromArray(prob_map.astype(np.float32))
-    prob_map_image.CopyInformation(image)
-
     upsampled = sitk.Resample(
-        prob_map_image,
+        prob_map,
         new_size,
         sitk.Transform(),
         sitk.sitkLinear,
-        prob_map_image.GetOrigin(),
+        prob_map.GetOrigin(),
         new_spacing,
-        prob_map_image.GetDirection(),
+        prob_map.GetDirection(),
         0,
-        prob_map_image.GetPixelID()
+        prob_map.GetPixelID()
     )
     
     upsampled_mask = sitk.GetArrayFromImage(upsampled) > threshold
@@ -91,6 +88,30 @@ def probability_mask_interpolation(image:sitk.Image, prob_map:np.ndarray, new_sp
 
     return upsampled_mask
 
+def sdf_interpolation(mask_image:sitk.Image, new_spacing):
+    """Upsample the mask image to the new spacing using signed distance field interpolation."""
+
+    new_size = _calculate_new_size(mask_image.GetSize(), mask_image.GetSpacing(), new_spacing)
+    
+    sdf_image= sitk.SignedMaurerDistanceMap(mask_image, insideIsPositive=False, squaredDistance=False, useImageSpacing=True)
+
+    upsampled = sitk.Resample(
+        sdf_image,
+        new_size,
+        sitk.Transform(),
+        sitk.sitkLinear,
+        sdf_image.GetOrigin(),
+        new_spacing,
+        sdf_image.GetDirection(),
+        0,
+        sdf_image.GetPixelID()
+    )
+
+    upsampled_mask = sitk.GetArrayFromImage(upsampled) < 0
+    upsampled_mask = sitk.GetImageFromArray(upsampled_mask.astype(np.uint8))
+    upsampled_mask.CopyInformation(upsampled)
+
+    return upsampled_mask
 
 # to measure evaluation error
 def round_trip(stl_path, spacing:np.ndarray, margin=5.0):
@@ -137,7 +158,7 @@ def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_ma
             missing_patients=patients.difference(available_subjects)
             raise ValueError(f"Missing patients: {missing_patients}")
     
-    results = {}
+    results = []
     for subject in tqdm.tqdm(sorted(available_subjects), desc="Running baselines"):
         
         stl_path = os.path.join(data_path, "Subjects", subject, f"{subject}.stl")
@@ -152,7 +173,7 @@ def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_ma
         if not os.path.exists(ts_path):
             raise ValueError(f"TotalSegmentator predictions not found for {subject} in {ts_pred_path}. Run TotalSegmentator first.")
         
-        targets=["femur_left,femur_right"]
+        targets=["femur_left","femur_right"]
         target=""
         if all(element in os.listdir(ts_path) for element in [target+".nii" for target in targets]):
             warnings.warn(f"TotalSegmentator predicted both femurs for {subject}, skipping subject.")
@@ -170,7 +191,7 @@ def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_ma
             ts_low_res_image=sitk.ReadImage(os.path.join(ts_path, "image_1p5mm.nii.gz"))
             ts_full_res_mask_image=sitk.ReadImage(os.path.join(ts_path, target+".nii"))
             ts_low_res_mask_image=sitk.ReadImage(os.path.join(ts_path,target+"_mask_1p5mm.nii.gz"))
-            ts_prob_map=np.load(os.path.join(ts_path,target+"_prob_1p5mm.nii.gz"))
+            ts_prob_map=sitk.ReadImage(os.path.join(ts_path,target+"_prob_1p5mm.nii.gz"))
             
         except Exception as e:
             raise ValueError(f"Error reading TotalSegmentator predictions for {subject} in {ts_path}: {e}")
@@ -182,29 +203,34 @@ def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_ma
         ts_metrics = calculate_metrics(ts_full_res_mask_image, stl_path)
         ts_metrics["baseline"] = "TotalSegmentator"
         ts_metrics["subject_id"] = subject_id
+        results.append(ts_metrics)
 
         # Oracle baseline
         _, oracle_mask_image = oracle(ct_image, stl_path, ts_spacing)
         oracle_metrics = calculate_metrics(oracle_mask_image, stl_path)
         oracle_metrics["baseline"] = "oracle"
         oracle_metrics["subject_id"] = subject_id
+        results.append(oracle_metrics)
         
         # Trilinear interpolation baseline
         trilinear_mask = trilinear_interpolation(ts_low_res_mask_image, ct_image.GetSpacing(), threshold=threshold)
         trilinear_metrics = calculate_metrics(trilinear_mask, stl_path)
         trilinear_metrics["baseline"] = "trilinear_interpolation"
         trilinear_metrics["subject_id"] = subject_id
+        results.append(trilinear_metrics)
         
         # Probability mask interpolation baseline
         prob_mask = probability_mask_interpolation(ts_low_res_image, ts_prob_map, ts_spacing, threshold=threshold)
         prob_metrics = calculate_metrics(prob_mask, stl_path)
         prob_metrics["baseline"] = "probability_mask_interpolation"
         prob_metrics["subject_id"] = subject_id
+        results.append(prob_metrics)
 
-        results[subject] = {
-            "oracle": oracle_metrics,
-            "trilinear_interpolation": trilinear_metrics,
-            "probability_mask_interpolation": prob_metrics
-        }
-    
+        # SDF interpolation baseline
+        sdf_mask = sdf_interpolation(ts_low_res_mask_image, ct_image.GetSpacing())
+        sdf_metrics = calculate_metrics(sdf_mask, stl_path)
+        sdf_metrics["baseline"] = "sdf_interpolation"
+        sdf_metrics["subject_id"] = subject_id
+        results.append(sdf_metrics)
+
     return results
