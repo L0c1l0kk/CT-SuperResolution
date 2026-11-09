@@ -19,7 +19,7 @@ from surface_distance import metrics as surface_metrics
 
 from config import HFValid, pred_path
 
-def stl_to_ct_mask(stl_path, ct_path=None, ct_image=None, output_path=None):
+def stl_to_ct_mask(stl_path, ct_path=None, ct_image=None):
     
     if ct_image is None and ct_path is None:
         raise ValueError("Either ct_path or ct_image must be provided.")
@@ -102,8 +102,11 @@ def stl_to_ct_mask(stl_path, ct_path=None, ct_image=None, output_path=None):
     result = vtk_to_numpy(
         stencil.GetOutput().GetPointData().GetScalars()
     ).reshape(size[2], size[1], size[0])
+    
+    result_image=sitk.GetImageFromArray(result.astype(np.uint8))
+    result_image.CopyInformation(ct_image)
 
-    return result.astype(bool)
+    return result_image
 
 
 def image_to_mesh(img: sitk.Image, level=0.5):

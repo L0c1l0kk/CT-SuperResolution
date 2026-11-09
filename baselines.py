@@ -16,8 +16,7 @@ def _calculate_new_size(old_size, old_spacing, new_spacing):
     ]
 
 def oracle(ct_image:sitk.Image, stl_path, new_spacing):
-    """Create an oracle baseline by downsampling the CT image and creating a mask from the STL file.
-    Returns a tuple of the downsampled CT image and the mask."""
+    """Create an oracle baseline by downsampling the CT image rasterizing the mesh onto it then upsampling the mask to the original resolution using trilinear interpolation."""
     if isinstance(ct_image, str):
         ct_image=sitk.ReadImage(ct_image)
     elif not isinstance(ct_image, sitk.Image):
@@ -25,22 +24,15 @@ def oracle(ct_image:sitk.Image, stl_path, new_spacing):
     
     new_size = _calculate_new_size(ct_image.GetSize(), ct_image.GetSpacing(), new_spacing)
 
-    downsampled_image = sitk.Resample(
-        ct_image,
-        new_size,
-        sitk.Transform(),
-        sitk.sitkLinear,
-        ct_image.GetOrigin(),
-        new_spacing,
-        ct_image.GetDirection(),
-        0,
-        ct_image.GetPixelID()
-    )
+    downsampled_reference=sitk.Image(new_size, sitk.sitkUInt8)
+    downsampled_reference.SetSpacing(new_spacing)
+    downsampled_reference.SetOrigin(ct_image.GetOrigin())
+    downsampled_reference.SetDirection(ct_image.GetDirection())
     
-    mask=stl_to_ct_mask(stl_path, ct_image=downsampled_image)
-    mask_image = sitk.GetImageFromArray(mask.astype(np.uint8))
-    mask_image.CopyInformation(downsampled_image)
-    return (downsampled_image, mask_image)
+    mask_image=stl_to_ct_mask(stl_path, ct_image=downsampled_reference)
+    upsampled_mask = trilinear_interpolation(mask_image, ct_image.GetSpacing())
+    
+    return upsampled_mask
 
 def trilinear_interpolation(mask_image:sitk.Image, new_spacing, threshold=0.5):
     """Upsample the mask image to the new spacing using trilinear interpolation."""
@@ -55,8 +47,8 @@ def trilinear_interpolation(mask_image:sitk.Image, new_spacing, threshold=0.5):
         mask_image.GetOrigin(),
         new_spacing,
         mask_image.GetDirection(),
-        0,
-        mask_image.GetPixelID()
+        0.0,
+        sitk.sitkFloat32
     )
     
     upsampled_mask = sitk.GetArrayFromImage(upsampled) > threshold
@@ -78,8 +70,8 @@ def probability_mask_interpolation(image:sitk.Image, prob_map:sitk.Image, new_sp
         prob_map.GetOrigin(),
         new_spacing,
         prob_map.GetDirection(),
-        0,
-        prob_map.GetPixelID()
+        0.0,
+        sitk.sitkFloat32
     )
     
     upsampled_mask = sitk.GetArrayFromImage(upsampled) > threshold
@@ -93,7 +85,12 @@ def sdf_interpolation(mask_image:sitk.Image, new_spacing):
 
     new_size = _calculate_new_size(mask_image.GetSize(), mask_image.GetSpacing(), new_spacing)
     
-    sdf_image= sitk.SignedMaurerDistanceMap(mask_image, insideIsPositive=False, squaredDistance=False, useImageSpacing=True)
+    sdf_in= sitk.SignedMaurerDistanceMap(mask_image, insideIsPositive=False, squaredDistance=False, useImageSpacing=True)
+    
+    inv = 1-mask_image
+
+    sdf_out = sitk.SignedMaurerDistanceMap(inv, insideIsPositive=False,squaredDistance=False, useImageSpacing=True)
+    sdf_image = 0.5 * (sdf_in - sdf_out)
 
     upsampled = sitk.Resample(
         sdf_image,
@@ -103,10 +100,10 @@ def sdf_interpolation(mask_image:sitk.Image, new_spacing):
         sdf_image.GetOrigin(),
         new_spacing,
         sdf_image.GetDirection(),
-        0,
-        sdf_image.GetPixelID()
+        0.0,
+        sitk.sitkFloat32
     )
-
+    
     upsampled_mask = sitk.GetArrayFromImage(upsampled) < 0
     upsampled_mask = sitk.GetImageFromArray(upsampled_mask.astype(np.uint8))
     upsampled_mask.CopyInformation(upsampled)
@@ -123,19 +120,13 @@ def round_trip(stl_path, spacing:np.ndarray, margin=5.0):
     b = np.asarray(mesh.bounds).reshape(3, 2)
     origin = b[:, 0] - margin
     dims = np.ceil((b[:, 1] - b[:, 0] + 2 * margin) / spacing).astype(int) + 1
-
-    # axis-aligned grid in the STL's own frame, so orientation can't interfere
-    grid = pv.ImageData(dimensions=dims, spacing=spacing, origin=tuple(origin))
-    sel = grid.select_enclosed_points(mesh, tolerance=0.0, check_surface=False)
-    inside = np.asarray(sel["SelectedPoints"]).reshape(dims, order="F")   # (x, y, z)
-
-    img = sitk.GetImageFromArray(inside.transpose(2, 1, 0).astype(np.uint8))  # (z, y, x)
-    img.SetSpacing(spacing)
-    img.SetOrigin(tuple(origin))
+    
+    temp_image = sitk.Image(dims.tolist(), sitk.sitkUInt8)
+    temp_image.SetSpacing(spacing)
+    temp_image.SetOrigin(origin)
+    img=stl_to_ct_mask(stl_path, ct_image=temp_image)
 
     metrics = calculate_metrics(img, stl_path, stl_is_ras=False)
-    tm = trimesh.load_mesh(stl_path)
-    metrics["volume_ratio_mask_to_stl"] = inside.sum() * np.prod(spacing) / tm.volume  # needs a watertight STL
     return metrics
 
 def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_margin=5.0, threshold=0.5, ts_pred_path=pred_path):
@@ -198,20 +189,33 @@ def run_all_baselines(subject_ids:list[int]|str,data_path=HFValid, round_trip_ma
         
 
         subject_id=int(subject[3:])
-
-        #TotalSegmentator metrics
-        ts_metrics = calculate_metrics(ts_full_res_mask_image, stl_path)
+        
+        
+        #TotalSegmentator low resolution metrics
+        ts_metrics = calculate_metrics(ts_low_res_mask_image, stl_path)
         ts_metrics["baseline"] = "TotalSegmentator"
         ts_metrics["subject_id"] = subject_id
         results.append(ts_metrics)
 
+        #TotalSegmentator full resolution metrics
+        ts_full_res_metrics = calculate_metrics(ts_full_res_mask_image, stl_path)
+        ts_full_res_metrics["baseline"] = "TotalSegmentator_nearest_neighbor"
+        ts_full_res_metrics["subject_id"] = subject_id
+        results.append(ts_full_res_metrics)
+
         # Oracle baseline
-        _, oracle_mask_image = oracle(ct_image, stl_path, ts_spacing)
+        oracle_mask_image = oracle(ct_image, stl_path, ts_spacing)
         oracle_metrics = calculate_metrics(oracle_mask_image, stl_path)
         oracle_metrics["baseline"] = "oracle"
         oracle_metrics["subject_id"] = subject_id
         results.append(oracle_metrics)
         
+        # Round trip baseline
+        round_trip_metrics = round_trip(stl_path, ts_spacing, margin=round_trip_margin) # Round trip error should be larger on lower resolution, so this is an upper bound
+        round_trip_metrics["baseline"] = "round_trip"
+        round_trip_metrics["subject_id"] = subject_id
+        results.append(round_trip_metrics)
+
         # Trilinear interpolation baseline
         trilinear_mask = trilinear_interpolation(ts_low_res_mask_image, ct_image.GetSpacing(), threshold=threshold)
         trilinear_metrics = calculate_metrics(trilinear_mask, stl_path)
