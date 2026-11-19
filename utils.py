@@ -17,7 +17,7 @@ from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk, numpy_to_v
 from surface_distance import metrics as surface_metrics
 
 
-from config import HFValid, pred_path
+from config import HFValid, pred_path, TARGETS
 
 def stl_to_ct_mask(stl_path, ct_path=None, ct_image=None):
     
@@ -172,7 +172,7 @@ def calculate_metrics(
     return {"assd_mm": float(assd), "hd95_mm": float(hd95), "surface_dice": surface_dice}
 
 
-TARGETS = ["femur_left", "femur_right"]   # extend for other bones
+   # extend for other bones
 
 _total_inv = {n: i for i, n in class_map["total"].items()}        # name -> global label
 _where = {n: (part, idx) for part, cmap in class_map_5_parts.items()
